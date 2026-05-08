@@ -15,7 +15,10 @@ from nanobot.utils.prompt_templates import render_template
 
 
 class ContextBuilder:
-    """Builds the context (system prompt + messages) for the agent."""
+    """
+    context 组装
+    Builds the context (system prompt + messages) for the agent.
+    """
 
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
@@ -34,7 +37,9 @@ class ContextBuilder:
         skill_names: list[str] | None = None,
         channel: str | None = None,
     ) -> str:
-        """Build the system prompt from identity, bootstrap files, memory, and skills."""
+        """
+        Build the system prompt from identity, bootstrap files, memory, and skills.
+        """
         parts = [self._get_identity(channel=channel)]
 
         bootstrap = self._load_bootstrap_files()
