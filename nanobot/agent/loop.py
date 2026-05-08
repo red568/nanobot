@@ -773,10 +773,13 @@ class AgentLoop:
                         effective_key,
                     )
                     continue
-            # Compute the effective session key before dispatching
-            # This ensures /stop command can find tasks correctly when unified session is enabled
+            
+            # 把确实要处理的消息包装为一个新的异步任务（asyncio Task），
+            # 并把这个任务添加到活跃任务列表中，以便后续管理（如取消）。当这个任务完成时，无论是正常完成还是被取消，都会从活跃任务列表中移除。
             task = asyncio.create_task(self._dispatch(msg))
             self._active_tasks.setdefault(effective_key, []).append(task)
+            
+            # 任务完成后执行一个回调函数，这个函数会检查这个任务是否还在活跃任务列表中，如果是，就把它移除掉。这确保了无论任务是正常完成还是被取消，都会被正确地清理出活跃任务列表，避免内存泄漏和错误的状态管理。
             task.add_done_callback(
                 lambda t, k=effective_key: self._active_tasks.get(k, [])
                 and self._active_tasks[k].remove(t)
@@ -792,20 +795,24 @@ class AgentLoop:
         session_key = self._effective_session_key(msg)
         if session_key != msg.session_key:
             msg = dataclasses.replace(msg, session_key_override=session_key)
+        # 获取或创建一个针对这个会话键的锁（Lock），确保同一会话的消息按顺序处理，避免并发冲突。
         lock = self._session_locks.setdefault(session_key, asyncio.Lock())
+        # 获取一个全局的并发控制门（Semaphore），如果配置了最大并发请求数的话。这个门用于限制同时处理的消息总数，防止系统过载。
         gate = self._concurrency_gate or nullcontext()
 
-        # Register a pending queue so follow-up messages for this session are
-        # routed here (mid-turn injection) instead of spawning a new task.
+        # 创建一个异步队列（Asyncio Queue），这个队列用于在当前消息处理过程中，临时存储同一会话中后续到达的消息。这些消息将在当前处理完成后被依次取出并处理，确保同一会话的消息按顺序处理。
         pending = asyncio.Queue(maxsize=20)
+        # 把刚才创建的队列，以 session_key（当前会话/用户的唯一标识）作为键，存入系统全局的字典 _pending_queues 中。
         self._pending_queues[session_key] = pending
 
         try:
+            #双重并发控制（Lock & Gate）
             async with lock, gate:
                 try:
                     on_stream = on_stream_end = None
                     if msg.metadata.get("_wants_stream"):
-                        # Split one answer into distinct stream segments.
+                        # 如果用户指定了流式输出，就为这个消息创建一个独特的流标识（stream ID），
+                        # 并定义两个回调函数 on_stream 和 on_stream_end。
                         stream_base_id = f"{msg.session_key}:{time.time_ns()}"
                         stream_segment = 0
 
@@ -835,10 +842,14 @@ class AgentLoop:
                             ))
                             stream_segment += 1
 
+                    # 调用核心处理函数 _process_message 来处理这个消息，并传入之前定义的流回调函数和待处理队列。
+                    # _process_message 是真正召唤大模型干活的地方，它会把前面的流式回调和消息队列（pending）都传进去。
+                    # 干完活后，系统会向 WebSocket 客户端发送一个带有 _turn_end: True 隐藏标记的空消息。
                     response = await self._process_message(
                         msg, on_stream=on_stream, on_stream_end=on_stream_end,
                         pending_queue=pending,
                     )
+
                     if response is not None:
                         await self.bus.publish_outbound(response)
                     elif msg.channel == "cli":
@@ -887,9 +898,7 @@ class AgentLoop:
                         content="Sorry, I encountered an error.",
                     ))
         finally:
-            # Drain any messages still in the pending queue and re-publish
-            # them to the bus so they are processed as fresh inbound messages
-            # rather than silently lost.
+            # 模块会在任务彻底结束前，把队列里所有没被处理的消息全都倒出来，并重新扔回系统的总入口（publish_inbound）
             queue = self._pending_queues.pop(session_key, None)
             if queue is not None:
                 leftover = 0
