@@ -27,26 +27,19 @@ FILE_MAX_MESSAGES = 2000
 class Session:
     """A conversation session."""
 
-    key: str  # channel:chat_id
+    key: str  # 会话的唯一标识，通常是 channel:chat_id 的形式
     messages: list[dict[str, Any]] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
-    last_consolidated: int = 0  # Number of messages already consolidated to files
+    last_consolidated: int = 0  #一个整数指针，已经压缩的最后一条消息的index
 
     @staticmethod
     def _annotate_message_time(message: dict[str, Any], content: Any) -> Any:
-        """Expose persisted turn timestamps to the model for relative-date reasoning.
-
-        Annotating *every* assistant turn trains the model (via in-context
-        demonstrations) to start its own replies with the same
-        ``[Message Time: ...]`` prefix, which leaks metadata back to the user.
-        We therefore only annotate:
-
-        * ``user`` turns — needed so the model can pin the conversation in time.
-        * proactive deliveries (``_channel_delivery=True``) — cron / heartbeat
-          assistant pushes that may sit hours away from the next user reply,
-          and are too infrequent to act as parroting demonstrations.
+        """
+        时间感知
+        在发给大模型之前，把消息的发送时间 [Message Time: xxx] 拼接到文本中，让模型具备“时间观念”（比如能理解“昨天”、“刚才”）。
+        精妙之处： 它只给“用户的消息”和“系统主动推送的消息”加时间戳，不给“助手正常的回复”加时间戳。
         """
         timestamp = message.get("timestamp")
         if not timestamp or not isinstance(content, str):
@@ -59,9 +52,12 @@ class Session:
         else:
             return content
         return f"[Message Time: {timestamp}]\n{content}"
+    
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
-        """Add a message to the session."""
+        """
+        本次session中，增加message。每条message至少包含role和content，其他的字段（比如工具调用结果、reasoning_content等）都放在kwargs里，直接存到message里，不需要预定义字段。
+        """
         msg = {
             "role": role,
             "content": content,
@@ -71,6 +67,7 @@ class Session:
         self.messages.append(msg)
         self.updated_at = datetime.now()
 
+
     def get_history(
         self,
         max_messages: int = 120,
@@ -78,17 +75,15 @@ class Session:
         max_tokens: int = 0,
         include_timestamps: bool = False,
     ) -> list[dict[str, Any]]:
-        """Return unconsolidated messages for LLM input.
-
-        History is sliced by message count first (``max_messages``), then by
-        token budget from the tail (``max_tokens``) when provided.
+        """
+        获取未被压缩的历史消息，供LLM输入使用。
+        历史消息首先按照消息数量（``max_messages``）进行切片，然后在提供 ``max_tokens`` 的情况下从尾部按照token预算进行切片。
         """
         unconsolidated = self.messages[self.last_consolidated:]
         max_messages = max_messages if max_messages > 0 else 120
         sliced = unconsolidated[-max_messages:]
 
-        # Avoid starting mid-turn when possible, except for proactive
-        # assistant deliveries that the user may be replying to.
+        # 寻找合理起点：强行让上下文的开头是一个 user（用户）的消息，或者系统主动推送的消息。避免上下文从模型说到一半的话开始。
         for i, message in enumerate(sliced):
             if message.get("role") == "user":
                 start = i
@@ -97,11 +92,14 @@ class Session:
                 sliced = sliced[start:]
                 break
 
-        # Drop orphan tool results at the front.
+        # 这里需要进行特殊处理避免【孤儿工具调用】,孤儿问题不符合llm api的规范，可能会导致报错
+        # 如果切片后的开头是一个工具调用结果（tool_calls），但它前面没有对应的工具调用（tool_call_id），就把这个工具调用结果也切掉。因为没有工具调用了，这个工具调用结果就成了“孤儿”，LLM看到它会很迷惑。
         start = find_legal_message_start(sliced)
         if start:
             sliced = sliced[start:]
 
+        
+        # 把信息内容和媒体信息（如果有的话）合成一个字符串，形成一个新的消息列表。这样做的目的是让LLM在重放历史消息时能够看到媒体的存在（通过占位符文本），而不是完全丢失媒体信息。
         out: list[dict[str, Any]] = []
         for message in sliced:
             content = message.get("content", "")
@@ -124,6 +122,8 @@ class Session:
                     entry[key] = message[key]
             out.append(entry)
 
+        
+        # 最后再按照token预算从尾部切片一次，确保提供给LLM的历史消息在token限制内。这个切片同样会尝试保持合理的起点，避免上下文从一条消息中途开始。
         if max_tokens > 0 and out:
             kept: list[dict[str, Any]] = []
             used = 0
@@ -163,23 +163,31 @@ class Session:
         self.last_consolidated = 0
         self.updated_at = datetime.now()
 
+    
+    
     def retain_recent_legal_suffix(self, max_messages: int) -> None:
-        """Keep a legal recent suffix constrained by a hard message cap."""
+        """
+        单个session级别的消息保留机制：
+        当消息数量超过指定的上限时，丢弃最旧的消息以保持在限制内，但会尽量保留一个合理的消息后缀（比如从最近的用户消息开始）。
+        这个函数不会直接触发归档机制
+        """
         if max_messages <= 0:
             self.clear()
             return
         if len(self.messages) <= max_messages:
             return
 
+        # 要保留的消息列表，初始为最后 max_messages 条消息的切片。
         retained = list(self.messages[-max_messages:])
 
-        # Prefer starting at a user turn when one exists within the tail.
+        # 这里的目标是让 retained 的开头是一个合理的起点，优先保证开头是一个用户消息（user），
+        # 如果没有用户消息了，再退而求其次保证开头是一个系统主动推送的消息（_channel_delivery）。
+        # 如果 retained 的开头是一个工具调用结果（tool_calls）但没有对应的工具调用（tool_call_id），就把这个工具调用结果也切掉，避免留下孤儿工具调用结果。
         first_user = next((i for i, m in enumerate(retained) if m.get("role") == "user"), None)
         if first_user is not None:
             retained = retained[first_user:]
         else:
-            # If the tail is assistant/tool-only, anchor to the latest user in
-            # the full session and take a capped forward window from there.
+        # 如果没有用户消息了，再退而求其次保证开头是一个系统主动推送的消息（_channel_delivery）。
             latest_user = next(
                 (i for i in range(len(self.messages) - 1, -1, -1)
                  if self.messages[i].get("role") == "user"),
@@ -188,7 +196,7 @@ class Session:
             if latest_user is not None:
                 retained = list(self.messages[latest_user: latest_user + max_messages])
 
-        # Mirror get_history(): avoid persisting orphan tool results at the front.
+        # 避免孤儿工具调用
         start = find_legal_message_start(retained)
         if start:
             retained = retained[start:]
@@ -200,17 +208,23 @@ class Session:
             if start:
                 retained = retained[start:]
 
+        # 记录下
         dropped = len(self.messages) - len(retained)
         self.messages = retained
         self.last_consolidated = max(0, self.last_consolidated - dropped)
         self.updated_at = datetime.now()
 
+    
+    
     def enforce_file_cap(
         self,
         on_archive: Any = None,
         limit: int = FILE_MAX_MESSAGES,
     ) -> None:
-        """Bound session message growth by archiving and trimming old prefixes."""
+        """
+        触发归档机制：当消息数量超过文件级别的硬上限时，丢弃最旧的消息以保持在限制内。
+        这个函数会调用 ``retain_recent_legal_suffix`` 来确保保留一个合理的消息后缀，并且在丢弃消息时通过 ``on_archive`` 回调提供被丢弃的消息（如果提供了回调的话）。
+        """
         if limit <= 0 or len(self.messages) <= limit:
             return
 
@@ -238,9 +252,10 @@ class Session:
 
 class SessionManager:
     """
-    Manages conversation sessions.
-
-    Sessions are stored as JSONL files in the sessions directory.
+    session 管理器
+    主要负责会话的加载、保存、列出和删除等功能。
+    会话以 JSONL 文件的形式存储在 sessions 目录下，每个会话对应一个文件。
+    SessionManager 提供了原子性的保存机制，确保在写入过程中不会导致数据损坏，并且支持在系统关闭时将所有会话持久化到磁盘以防止数据丢失。
     """
 
     def __init__(self, workspace: Path):
@@ -264,13 +279,9 @@ class SessionManager:
 
     def get_or_create(self, key: str) -> Session:
         """
-        Get an existing session or create a new one.
-
-        Args:
-            key: Session key (usually channel:chat_id).
-
-        Returns:
-            The session.
+        缓存机制
+        如果这个session已经在内存缓存里了，就直接返回；
+        如果不在，就从磁盘加载；如果磁盘上也没有，就创建一个新的session。无论是加载还是创建，都会把session放到内存缓存里。
         """
         if key in self._cache:
             return self._cache[key]
@@ -283,7 +294,11 @@ class SessionManager:
         return session
 
     def _load(self, key: str) -> Session | None:
-        """Load a session from disk."""
+        """
+        从硬盘中加载session。
+        首先尝试从当前的sessions目录加载，如果没有找到，再尝试从legacy_sessions_dir加载（这是之前版本的存储位置）。
+        如果在legacy_sessions_dir找到了，会把它迁移到新的sessions目录。
+        """
         path = self._get_session_path(key)
         if not path.exists():
             legacy_path = self._get_legacy_session_path(key)
@@ -336,7 +351,10 @@ class SessionManager:
             return repaired
 
     def _repair(self, key: str) -> Session | None:
-        """Attempt to recover a session from a corrupt JSONL file."""
+        """
+        从损坏的 JSONL 文件中尝试恢复 session。
+        这个函数会尝试读取文件中的每一行，跳过无法解析的行，并从剩余的有效数据中重建一个 Session 对象。它会记录跳过了多少行，并在成功恢复时记录恢复的消息数量。如果恢复失败，则返回 None
+        """
         path = self._get_session_path(key)
         if not path.exists():
             return None
@@ -401,7 +419,8 @@ class SessionManager:
         }
 
     def save(self, session: Session, *, fsync: bool = False) -> None:
-        """Save a session to disk atomically.
+        """
+        保存session到磁盘，使用原子性写入机制确保数据完整性。
 
         When *fsync* is ``True`` the final file and its parent directory are
         explicitly flushed to durable storage.  This is intentionally off by
@@ -415,6 +434,7 @@ class SessionManager:
 
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
+                # 第一行会记录元数据（metadata），包括创建时间、更新时间、消息数量等信息，方便快速加载和列表展示。
                 metadata_line = {
                     "_type": "metadata",
                     "key": session.key,
@@ -424,6 +444,8 @@ class SessionManager:
                     "last_consolidated": session.last_consolidated
                 }
                 f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
+                
+                # 后续的每一行都是一条消息的 JSON 表示。
                 for msg in session.messages:
                     f.write(json.dumps(msg, ensure_ascii=False) + "\n")
                 if fsync:
