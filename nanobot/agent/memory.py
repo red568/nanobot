@@ -28,7 +28,8 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# MemoryStore — pure file I/O layer
+# MemoryStore — pure file I/O layer 
+# 单纯的文件读写，没有任何智能或格式化功能，负责管理 MEMORY.md, history.jsonl, SOUL.md, USER.md 等文件。
 # ---------------------------------------------------------------------------
 
 class MemoryStore:
@@ -423,6 +424,7 @@ class MemoryStore:
 
 # ---------------------------------------------------------------------------
 # Consolidator — lightweight token-budget triggered consolidation
+# 压缩器：当历史消息过多时，使用LLM生成摘要并存储在history.jsonl中，以节省上下文空间。
 # ---------------------------------------------------------------------------
 
 
@@ -462,6 +464,8 @@ class Consolidator:
         self.consolidation_ratio = consolidation_ratio
         self._build_messages = build_messages
         self._get_tool_definitions = get_tool_definitions
+        # session级别的锁，确保同一session的consolidation不会并发执行，避免竞争条件和重复归档。
+        # 使用WeakValueDictionary以便自动清理不再使用的session锁，避免爆内存
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
             weakref.WeakValueDictionary()
         )
@@ -486,7 +490,11 @@ class Consolidator:
         session: Session,
         tokens_to_remove: int,
     ) -> tuple[int, int] | None:
-        """Pick a user-turn boundary that removes enough old prompt tokens."""
+        """
+        智能寻找切割点
+        逻辑：它会从尚未压缩的旧消息开始遍历，累加它们的 Token 数量。
+        当累加量达到需要移除的目标 Token 数时，它只会在 role == "user"（用户发言）的地方下刀。
+        """
         start = session.last_consolidated
         if start >= len(session.messages) or tokens_to_remove <= 0:
             return None
@@ -587,7 +595,9 @@ class Consolidator:
         *,
         session_summary: str | None = None,
     ) -> None:
-        """Loop: archive old messages until prompt fits within safe budget.
+        """
+        Loop中的调用逻辑：
+        Loop: archive old messages until prompt fits within safe budget.
 
         The budget reserves space for completion tokens and a safety buffer
         so the LLM request never exceeds the context window.
@@ -688,6 +698,7 @@ class Consolidator:
 
 # ---------------------------------------------------------------------------
 # Dream — heavyweight cron-scheduled memory consolidation
+# Dream —重量级的cron调度内存整合器：定期分析历史记录并对文件进行增量编辑，而不是完全替、
 # ---------------------------------------------------------------------------
 
 

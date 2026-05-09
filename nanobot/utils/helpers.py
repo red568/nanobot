@@ -381,7 +381,7 @@ def estimate_prompt_tokens(
 
 
 def estimate_message_tokens(message: dict[str, Any]) -> int:
-    """Estimate prompt tokens contributed by one persisted message."""
+    """估算单条消息在发送给大模型（LLM）时会消耗多少个 Token"""
     content = message.get("content")
     parts: list[str] = []
     if isinstance(content, str):
@@ -424,7 +424,15 @@ def estimate_prompt_tokens_chain(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
 ) -> tuple[int, str]:
-    """Estimate prompt tokens via provider counter first, then tiktoken fallback."""
+    """
+    精确计算token的一个优先级chain
+    1. 第一优先级：调用云端供应商的计算器 (Provider Counter)
+    代码首先尝试寻找 provider（即 API 提供商，如 OpenAI、Anthropic、DeepSeek 等）自带的计算方法。
+
+    2. 第二优先级：使用本地的 tiktoken 库进行估算 (Local Estimation)
+    如果 provider 没有提供计算方法，或者调用失败，则退回到本地的 tiktoken 库进行估算。
+    3. 第三优先级：返回 0 并标记为 none
+    """
     provider_counter = getattr(provider, "estimate_prompt_tokens", None)
     if callable(provider_counter):
         with suppress(Exception):
