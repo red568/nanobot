@@ -40,16 +40,23 @@ class ContextBuilder:
         """
         Build the system prompt from identity, bootstrap files, memory, and skills.
         """
+
+        # 读取系统信息和用户偏好信息，并渲染agent/identity.md模板
         parts = [self._get_identity(channel=channel)]
 
+        # 加载文件并拼接["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
             parts.append(bootstrap)
 
+        # 加载记忆内容，如果用户没有修改过默认的记忆模板，则不加入系统提示，避免占用token
         memory = self.memory.get_memory_context()
         if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
             parts.append(f"# Memory\n\n{memory}")
 
+        # 加载技能信息，分为两部分：
+        # 一部分是always技能，无论是否在当前对话中使用都展示；
+        # 另一部分是其他技能，渐进式纰漏
         always_skills = self.skills.get_always_skills()
         if always_skills:
             always_content = self.skills.load_skills_for_context(always_skills)
@@ -60,6 +67,8 @@ class ContextBuilder:
         if skills_summary:
             parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
 
+        
+        #提取最近未处理的历史记录，对其进行格式化和双重长度限制，最后将其组装成一段文本，以便提供给大语言模型（LLM）作为上下文参考。
         entries = self.memory.read_unprocessed_history(since_cursor=self.memory.get_last_dream_cursor())
         if entries:
             capped = entries[-self._MAX_RECENT_HISTORY:]
@@ -72,7 +81,10 @@ class ContextBuilder:
         return "\n\n---\n\n".join(parts)
 
     def _get_identity(self, channel: str | None = None) -> str:
-        """Get the core identity section."""
+        """
+        获取操作系统信息和用户偏好信息agent/identity.md
+        Get the core identity section.
+        """
         workspace_path = str(self.workspace.expanduser().resolve())
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
@@ -115,7 +127,10 @@ class ContextBuilder:
         return _to_blocks(left) + _to_blocks(right)
 
     def _load_bootstrap_files(self) -> str:
-        """Load all bootstrap files from workspace."""
+        """
+        加载工作去全部引导文件：["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
+        
+        """
         parts = []
 
         for filename in self.BOOTSTRAP_FILES:
