@@ -144,7 +144,7 @@ def image_placeholder_text(path: str | None, *, empty: str = "[image]") -> str:
 
 
 def truncate_text(text: str, max_chars: int) -> str:
-    """Truncate text with a stable suffix."""
+    """限制一段文本的最大长度，并在文本过长被截断时，在末尾添加一个明确的提示后缀。"""
     if max_chars <= 0 or len(text) <= max_chars:
         return text
     return text[:max_chars] + "\n... (truncated)"

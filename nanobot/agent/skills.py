@@ -8,7 +8,7 @@ from pathlib import Path
 
 import yaml
 
-# Default builtin skills directory (relative to this file)
+# 内置skills Default builtin skills directory (relative to this file)
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills"
 
 # Opening ---, YAML body (group 1), closing --- on its own line; supports CRLF.

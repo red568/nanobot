@@ -29,7 +29,8 @@ if TYPE_CHECKING:
 
 # ---------------------------------------------------------------------------
 # MemoryStore — pure file I/O layer 
-# 单纯的文件读写，没有任何智能或格式化功能，负责管理 MEMORY.md, history.jsonl, SOUL.md, USER.md 等文件。
+# 单纯的文件读写，没有任何智能或格式化功能，
+# 主要负责维护管理 MEMORY.md, history.jsonl, SOUL.md, USER.md 这四个文件。
 # ---------------------------------------------------------------------------
 
 class MemoryStore:
@@ -73,8 +74,10 @@ class MemoryStore:
         except FileNotFoundError:
             return ""
 
+    # -- 迁移相关，技术债，不用看 -----------------------------------------
     def _maybe_migrate_legacy_history(self) -> None:
-        """One-time upgrade from legacy HISTORY.md to history.jsonl.
+        """
+        一次从旧系统到老系统的迁移： HISTORY.md -》 history.jsonl.
 
         The migration is best-effort and prioritizes preserving as much content
         as possible over perfect parsing.
@@ -227,7 +230,8 @@ class MemoryStore:
     # -- history.jsonl — append-only, JSONL format ---------------------------
 
     def append_history(self, entry: str, *, max_chars: int | None = None) -> int:
-        """Append *entry* to history.jsonl and return its auto-incrementing cursor.
+        """
+        Append *entry* to history.jsonl and return its auto-incrementing cursor.
 
         Entries are passed through `strip_think` to drop template-level leaks
         (e.g. unclosed `<think` prefixes, `<channel|>` markers) before being
@@ -386,6 +390,7 @@ class MemoryStore:
     # -- dream cursor --------------------------------------------------------
 
     def get_last_dream_cursor(self) -> int:
+        # 记录上次Dream处理到哪个位置cursor了，这样下次就可以从那里继续往后处理，避免重复处理历史记录。
         if self._dream_cursor_file.exists():
             with suppress(ValueError, OSError):
                 return int(self._dream_cursor_file.read_text(encoding="utf-8").strip())
@@ -398,6 +403,10 @@ class MemoryStore:
 
     @staticmethod
     def _format_messages(messages: list[dict]) -> str:
+        """
+        [2023-10-27T10:00] USER: 今天东京天气怎么样？
+        [2023-10-27T10:00] ASSISTANT [tools: weather_api, location_service]: 今天东京晴天，气温20度。
+        """"
         lines = []
         for message in messages:
             if not message.get("content"):
@@ -409,7 +418,10 @@ class MemoryStore:
         return "\n".join(lines)
 
     def raw_archive(self, messages: list[dict], *, max_chars: int | None = None) -> None:
-        """Fallback: dump raw messages to history.jsonl without LLM summarization."""
+        """
+        直接把原始消息 dump 到 history.jsonl 里，作为一种降级手段，当 LLM 生成摘要失败时，确保历史记录不会丢失。
+        Fallback: dump raw messages to history.jsonl without LLM summarization.
+        """
         limit = max_chars if max_chars is not None else _RAW_ARCHIVE_MAX_CHARS
         formatted = truncate_text(self._format_messages(messages), limit)
         self.append_history(
@@ -517,7 +529,10 @@ class Consolidator:
         *,
         session_summary: str | None = None,
     ) -> tuple[int, str]:
-        """Estimate current prompt size for the normal session history view."""
+        """
+        Estimate current prompt size for the normal session history view.
+        根据优先级来预估token数量：有两个返回参数，一个是预估的token数量，一个是预估来源的字符串（"probe"或"estimate"），以便日志记录和调试。
+        """
         history = session.get_history(max_messages=0, include_timestamps=True)
         channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
         probe_messages = self._build_messages(
@@ -537,7 +552,10 @@ class Consolidator:
 
     @property
     def _input_token_budget(self) -> int:
-        """Available input token budget for consolidation LLM."""
+        """
+        计算在调用大语言模型（LLM）进行“总结/整合（Consolidation）”任务时，实际还能剩下多少个 Token 用于输入数据。
+        上下文窗口总量-预留输出量-安全缓冲，确保即使在估算不准确的情况下也不会超出模型的限制。
+        """
         return self.context_window_tokens - self.max_completion_tokens - self._SAFETY_BUFFER
 
     def _truncate_to_token_budget(self, text: str) -> str:
@@ -555,9 +573,8 @@ class Consolidator:
             return truncate_text(text, budget * 4)
 
     async def archive(self, messages: list[dict]) -> str | None:
-        """Summarize messages via LLM and append to history.jsonl.
-
-        Returns the summary text on success, None if nothing to archive.
+        """
+        压缩信息摘要到 history.jsonl.
         """
         if not messages:
             return None
@@ -596,6 +613,7 @@ class Consolidator:
         session_summary: str | None = None,
     ) -> None:
         """
+        重要！重要！重要
         Loop中的调用逻辑：
         Loop: archive old messages until prompt fits within safe budget.
 
@@ -605,6 +623,7 @@ class Consolidator:
         if not session.messages or self.context_window_tokens <= 0:
             return
 
+        # 获取该会话【压缩锁】，确保同一会话的压缩操作不会并发执行，避免竞争条件和重复归档。
         lock = self.get_lock(session.key)
         async with lock:
             budget = self._input_token_budget
@@ -710,11 +729,18 @@ _STALE_THRESHOLD_DAYS = 14
 
 
 class Dream:
-    """Two-phase memory processor: analyze history.jsonl, then edit files via AgentRunner.
+    """
+    在人类睡眠时，大脑会回放白天的短期记忆，提取关键信息并将其转化为长期记忆，同时遗忘无关的细节
+    模仿这个，对 history.jsonl进行分析，提取关键信息并更新 MEMORY.md、SOUL.md、USER.md 等文件。
+    分为两个阶段：
+        Phase 1: 提炼与分析 (Analysis)
+        系统会读取自上次“做梦”以来尚未处理的近期聊天记录（history.jsonl），并将其与当前的长期记忆（MEMORY.md）、用户画像（USER.md）和底层人设（SOUL.md）一起打包发给 LLM。
+        LLM 在这一阶段只看不改，它的任务是生成一份“分析报告”：比如“用户今天说自己戒烟了，需要更新 USER.md”或者“昨天讨论的代码问题已经解决，可以从 MEMORY.md 中删除了”。
 
-    Phase 1 produces an analysis summary (plain LLM call).
-    Phase 2 delegates to AgentRunner with read_file / edit_file tools so the
-    LLM can make targeted, incremental edits instead of replacing entire files.
+        Phase 2: 授权执行 (Delegation to AgentRunner)
+        系统将 Phase 1 生成的“分析报告”交给一个具备实际动手能力的 Agent（AgentRunner）。
+        这个 Agent 被赋予了读取文件（ReadFileTool）、编辑文件（EditFileTool）甚至创建新技能（WriteFileTool）的工具权限。
+        Agent 会像一个程序员一样，打开文件，精准地修改特定的行，然后保存。这种“渐进式修改”比让 LLM 一次性重写整个文件要稳定和安全得多。
     """
 
     # Caps on prompt-bound inputs so Dream's LLM calls never exceed the model's
@@ -742,9 +768,8 @@ class Dream:
         self.max_batch_size = max_batch_size
         self.max_iterations = max_iterations
         self.max_tool_result_chars = max_tool_result_chars
-        # Kill switch for the git-blame-based per-line age annotation in Phase 1.
-        # Default True keeps the #3212 behavior; set False to feed MEMORY.md raw
-        # (e.g. if a specific LLM reacts poorly to the `← Nd` suffix).
+        # 默认ture，这个功能会在 MEMORY.md 的每一行后面添加一个年龄注释（例如“← 30d”），表示自上次修改以来的天数。
+        # 这可以帮助 LLM 识别哪些信息可能已经过时了，从而更好地决定是否保留、更新或删除这些信息。
         self.annotate_line_ages = annotate_line_ages
         self._runner = AgentRunner(provider)
         self._tools = self._build_tools()
@@ -757,7 +782,10 @@ class Dream:
     # -- tool registry -------------------------------------------------------
 
     def _build_tools(self) -> ToolRegistry:
-        """Build a minimal tool registry for the Dream agent."""
+        """
+        Build a minimal tool registry for the Dream agent.
+        主要是读写文件的工具，允许它根据分析报告修改 MEMORY.md、SOUL.md、USER.md，或者在 skills/ 下创建新技能。
+        """
         from nanobot.agent.skills import BUILTIN_SKILLS_DIR
         from nanobot.agent.tools.file_state import FileStates
         from nanobot.agent.tools.filesystem import EditFileTool, ReadFileTool, WriteFileTool
@@ -786,7 +814,10 @@ class Dream:
     # -- skill listing --------------------------------------------------------
 
     def _list_existing_skills(self) -> list[str]:
-        """List existing skills as 'name — description' for dedup context."""
+        """
+        列出现有技能，格式为 'name — description'，用于去重上下文。
+        List existing skills as 'name — description' for dedup context.
+        """
         import re as _re
 
         from nanobot.agent.skills import BUILTIN_SKILLS_DIR
@@ -814,14 +845,9 @@ class Dream:
     # -- main entry ----------------------------------------------------------
 
     def _annotate_with_ages(self, content: str) -> str:
-        """Append per-line age suffixes to MEMORY.md content.
-
-        Each non-blank line whose age exceeds ``_STALE_THRESHOLD_DAYS`` gets a
-        suffix like ``← 30d`` indicating days since last modification.
-        Returns the original content unchanged if git is unavailable,
-        annotate fails, or the line count doesn't match the age count
-        (which can happen with an uncommitted working-tree edit — better to
-        skip annotation than to tag the wrong line).
+        """
+        给 MEMORY.md 文件中的文本内容“打上时间戳后缀”。
+        它会逐行检查文本，如果某行内容存在的时间超过了设定的天数，就在那行末尾加上类似 ← 30d 的标记，告诉大模型（LLM）这条记忆信息已经存在了多久。
         SOUL.md and USER.md are never annotated.
         """
         file_path = "memory/MEMORY.md"
@@ -860,38 +886,42 @@ class Dream:
         return result
 
     async def run(self) -> bool:
-        """Process unprocessed history entries. Returns True if work was done."""
+        """
+        核心入口，会以周期任务的形式被调用，比如每天凌晨一次。
+        Process unprocessed history entries. Returns True if work was done.
+        """
         from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 
+        # 记录上次处理到哪个位置，并取出还未处理的历史记录
         last_cursor = self.store.get_last_dream_cursor()
         entries = self.store.read_unprocessed_history(since_cursor=last_cursor)
         if not entries:
             return False
 
+        # 一次只处理一批，避免一次处理过多导致的性能问题；剩余的留到下次 cron 调用时继续处理。
         batch = entries[: self.max_batch_size]
         logger.info(
             "Dream: processing {} entries (cursor {}→{}), batch={}",
             len(entries), last_cursor, batch[-1]["cursor"], len(batch),
         )
 
-        # Build history text for LLM — cap each entry so a legacy oversized
-        # record (e.g. pre-#3412 raw_archive dump) can't blow up the prompt.
+        # 把历史记录拼在一起，作为 Phase 1 的输入。
+        # 每条记录都加上时间戳，并且内容被截断到 _HISTORY_ENTRY_PREVIEW_MAX_CHARS，以防单条记录过大。
         history_text = "\n".join(
             f"[{e['timestamp']}] "
             f"{truncate_text(e['content'], self._HISTORY_ENTRY_PREVIEW_MAX_CHARS)}"
             for e in batch
         )
 
-        # Current file contents + per-line age annotations (MEMORY.md only).
-        # Each file is capped in the *prompt preview* only; Phase 2 still sees
-        # the full file via the read_file tool.
         current_date = datetime.now().strftime("%Y-%m-%d")
         raw_memory = self.store.read_memory() or "(empty)"
+        # 给 MEMORY.md 添加时间后缀标签
         annotated_memory = (
             self._annotate_with_ages(raw_memory)
             if self.annotate_line_ages
             else raw_memory
         )
+        #读取 MEMORY.md、SOUL.md、USER.md 的内容，并进行长度截断
         current_memory = truncate_text(annotated_memory, self._MEMORY_FILE_MAX_CHARS)
         current_soul = truncate_text(
             self.store.read_soul() or "(empty)", self._SOUL_FILE_MAX_CHARS,
@@ -907,7 +937,7 @@ class Dream:
             f"## Current USER.md ({len(current_user)} chars)\n{current_user}"
         )
 
-        # Phase 1: Analyze (no skills list — dedup is Phase 2's job)
+#####-------------- 阶段一：分析。不提供技能列表，去重是阶段二的工作-----------------------#####
         phase1_prompt = (
             f"## Conversation History\n{history_text}\n\n{file_context}"
         )
@@ -935,7 +965,7 @@ class Dream:
             logger.exception("Dream Phase 1 failed")
             return False
 
-        # Phase 2: Delegate to AgentRunner with read_file / edit_file
+#-------------------------------- 阶段2：执行-------------------------------------------------
         existing_skills = self._list_existing_skills()
         skills_section = ""
         if existing_skills:

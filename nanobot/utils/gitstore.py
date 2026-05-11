@@ -43,7 +43,11 @@ def _compute_line_ages(annotated) -> list[LineAge]:
 
 
 class GitStore:
-    """Git-backed version control for memory files."""
+    """
+    专门为 AI（这里的 nanobot）设计的、轻量级的本地 Git 版本控制封装器。
+    核心作用是：像游戏存档一样，自动且静默地管理 AI 的“记忆文件”（如 MEMORY.md 等）的版本历史。
+    使用了 dulwich 库（一个纯 Python 实现的 Git 库），这意味着它不需要系统安装了命令行的 git 程序就能直接操作 Git 仓库。
+    """
 
     def __init__(self, workspace: Path, tracked_files: list[str]):
         self._workspace = workspace
