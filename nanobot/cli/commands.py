@@ -55,6 +55,13 @@ from nanobot.utils.restart import (
     should_show_cli_restart_notice,
 )
 
+""""
+这一部分创建了 CLI 应用的实例对象 app，并进行了一些非常友好的用户体验配置：
+name="nanobot": 设定了该应用的内部名称。
+context_settings={"help_option_names": ["-h", "--help"]}: 配置底层参数。默认情况下 Typer 可能仅支持通过 --help 呼出帮助菜单，这行代码让用户无论是输入 -h 还是 --help 都能查看帮助信息，更符合主流 Linux/Unix 命令行的使用习惯。
+help=...: 定义了当用户呼出帮助菜单时，显示在最顶部的程序介绍。这里使用了一个 f-string，拼接了一个提前定义好的 __logo__ 变量（可能是一些 ASCII 艺术字）。
+no_args_is_help=True: 这是一个非常实用的设定。 如果用户在终端里只输入了主命令（比如直接敲 nanobot 后回车），既没有提供任何参数，也没有输入子命令，程序不会抛出“缺少参数”的错误，而是会自动打印出帮助菜单引导用户。
+"""
 app = typer.Typer(
     name="nanobot",
     context_settings={"help_option_names": ["-h", "--help"]},
@@ -281,7 +288,7 @@ def main(
 
 
 # ============================================================================
-# Onboard / Setup
+# Onboard / Setup 初始化
 # ============================================================================
 
 
@@ -291,10 +298,13 @@ def onboard(
     config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
     wizard: bool = typer.Option(False, "--wizard", help="Use interactive wizard"),
 ):
-    """Initialize nanobot configuration and workspace."""
+    """
+    初始化配置项和工作区。
+    """
     from nanobot.config.loader import get_config_path, load_config, save_config, set_config_path
     from nanobot.config.schema import Config
 
+    # 优先使用用户指定的配置路径，否则使用默认路径
     if config:
         config_path = Path(config).expanduser().resolve()
         set_config_path(config_path)
@@ -307,8 +317,10 @@ def onboard(
             loaded.agents.defaults.workspace = workspace
         return loaded
 
-    # Create or update config
+    
+    # 创建配置，如果配置已经存在了，则让用户选择是否overWrite（丢失现有值）还是refresh（保留现有值并添加新字段）。
     if config_path.exists():
+        # 如果用户要求交互式向导，则进入向导模式，因为用户指定了要运行配置向导，程序没必要在这里反复询问是否覆盖，而是直接把现有数据加载到内存中，留给接下来的向导界面去处理。
         if wizard:
             config = _apply_workspace_override(load_config(config_path))
         else:
@@ -320,10 +332,12 @@ def onboard(
                 "  [bold]N[/bold] = refresh config, keeping existing values and adding new fields"
             )
             if typer.confirm("Overwrite?"):
+                # 覆盖写入默认配置，丢失现有值
                 config = _apply_workspace_override(Config())
                 save_config(config, config_path)
                 console.print(f"[green]✓[/green] Config reset to defaults at {config_path}")
             else:
+                # 刷新配置，保留现有值并添加新字段
                 config = _apply_workspace_override(load_config(config_path))
                 save_config(config, config_path)
                 console.print(
@@ -336,7 +350,9 @@ def onboard(
             save_config(config, config_path)
             console.print(f"[green]✓[/green] Created config at {config_path}")
 
-    # Run interactive wizard if enabled
+    
+    
+    # 如果是引导式配置，则进入引导界面，run_onboard()
     if wizard:
         from nanobot.cli.onboard import run_onboard
 
@@ -353,14 +369,18 @@ def onboard(
             console.print(f"[red]✗[/red] Error during configuration: {e}")
             console.print("[yellow]Please run 'nanobot onboard' again to complete setup.[/yellow]")
             raise typer.Exit(1)
+        
+
+    # 对不同频道（内置和插件）注入默认配置。
     _onboard_plugins(config_path)
 
-    # Create workspace, preferring the configured workspace path.
+    # 如果用户指定了工作区路径，或者配置文件里已经有了工作区路径，那么就使用那个路径，否则使用默认路径
     workspace_path = get_workspace_path(config.workspace_path)
     if not workspace_path.exists():
         workspace_path.mkdir(parents=True, exist_ok=True)
         console.print(f"[green]✓[/green] Created workspace at {workspace_path}")
 
+    # 无论如何都同步一次模板，以确保工作区里有最新的工具和技能模板
     sync_workspace_templates(workspace_path)
 
     agent_cmd = 'nanobot agent -m "Hello!"'
@@ -398,7 +418,10 @@ def _merge_missing_defaults(existing: Any, defaults: Any) -> Any:
 
 
 def _onboard_plugins(config_path: Path) -> None:
-    """Inject default config for all discovered channels (built-in + plugins)."""
+    """
+    为所有已发现的频道（内置和插件）注入默认配置。
+    这确保了即使用户没有手动配置频道，它们也会有默认设置，并且在引导式配置中添加新频道时不会覆盖现有配置。
+    """
     import json
 
     from nanobot.channels.registry import discover_all
@@ -436,7 +459,9 @@ def _make_provider(config: Config):
 
 
 def _load_runtime_config(config: str | None = None, workspace: str | None = None) -> Config:
-    """Load config and optionally override the active workspace."""
+    """
+    加载相关配置，并根据需要覆盖当前活动的工作区。
+    """
     from nanobot.config.loader import load_config, resolve_config_env_vars, set_config_path
 
     config_path = None
@@ -1027,7 +1052,7 @@ def agent(
     if is_default_workspace(config.workspace_path):
         _migrate_cron_store(config)
 
-    # Create cron service with workspace-scoped store
+    # 在工作区范围内创建 cron 服务，使用持久化存储路径
     cron_store_path = config.workspace_path / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
 

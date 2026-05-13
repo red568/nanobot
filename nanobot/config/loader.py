@@ -95,6 +95,10 @@ def resolve_config_env_vars(config: Config) -> Config:
 
 
 def _resolve_in_place(obj: Any) -> Any:
+    """"
+    深度遍历各种复杂的数据结构（特别是 Pydantic 模型、字典和列表），找到其中的字符串，
+    并将其中的“环境变量占位符”替换为真实的系统环境变量值
+    """
     if isinstance(obj, str):
         new = _ENV_REF_PATTERN.sub(_env_replace, obj)
         return new if new != obj else obj
